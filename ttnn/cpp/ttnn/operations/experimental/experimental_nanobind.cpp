@@ -65,6 +65,7 @@
 #include "ttnn/operations/experimental/deepseek_moe_post_combine_tilize/deepseek_moe_post_combine_tilize_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/masked_bincount/masked_bincount_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/offset_cumsum/offset_cumsum_nanobind.hpp"
+#include "ttnn/operations/experimental/mamba/mamba_ssd_recurrence_nanobind.hpp"
 
 namespace ttnn::operations::experimental {
 
@@ -107,6 +108,7 @@ void py_module(nb::module_& mod) {
     ssm::detail::bind_prefix_scan(mod);
     ssm::detail::bind_repeat_and_interleave_eltwise_mul(mod);
     ssm::detail::bind_hc_sum_reduce(mod);
+    mamba::detail::bind_mamba_ssd_recurrence(mod);
 
     cnn::detail::bind_convert_to_chw(mod);
     cnn::detail::bind_convert_to_hwc(mod);
