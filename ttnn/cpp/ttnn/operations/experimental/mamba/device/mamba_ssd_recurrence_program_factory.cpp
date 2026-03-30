@@ -90,7 +90,7 @@ MambaSSDRecurrenceProgramFactory::cached_program_t MambaSSDRecurrenceProgramFact
     const auto a_end_tile_size = tt::tile_size(a_end_data_format);
     const auto states_out_tile_size = tt::tile_size(states_out_data_format);
     const auto final_state_tile_size = tt::tile_size(final_state_data_format);
-    const auto intermediary_data_format = tt::DataFormat::Float16_b;
+    const auto intermediary_data_format = tt::DataFormat::Float32;
     const auto intermediary_tile_size = tt::tile_size(intermediary_data_format);
 
     constexpr uint32_t states_cb_index = tt::CBIndex::c_0;
@@ -131,7 +131,8 @@ MambaSSDRecurrenceProgramFactory::cached_program_t MambaSSDRecurrenceProgramFact
     tt::tt_metal::CreateCircularBuffer(
         program,
         work_split.all_cores,
-        tt::tt_metal::CircularBufferConfig(final_state_tile_size, {{final_state_cb_index, final_state_data_format}})
+        tt::tt_metal::CircularBufferConfig(
+            max_hidden_tiles_per_core * final_state_tile_size, {{final_state_cb_index, final_state_data_format}})
             .set_page_size(final_state_cb_index, final_state_tile_size));
     tt::tt_metal::CreateCircularBuffer(
         program,
@@ -178,7 +179,7 @@ MambaSSDRecurrenceProgramFactory::cached_program_t MambaSSDRecurrenceProgramFact
         h_cb_index,
         exp_a_cb_index,
         h_acc_cb_index,
-        1};
+        3};
     auto writer_compile_args = std::vector<uint32_t>{states_out_cb_index, final_state_cb_index};
     tt::tt_metal::TensorAccessorArgs(*states_buffer).append_to(reader_compile_args);
     tt::tt_metal::TensorAccessorArgs(*initial_states_buffer).append_to(reader_compile_args);

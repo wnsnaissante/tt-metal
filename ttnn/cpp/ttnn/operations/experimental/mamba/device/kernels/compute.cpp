@@ -107,7 +107,9 @@ FORCE_INLINE void compute_recurrence_tile(
     uint32_t cb_ah,
     uint32_t cb_h,
     uint32_t cb_states_out,
-    uint32_t cb_h_acc) {
+    uint32_t cb_h_acc,
+    uint32_t cb_final_state,
+    bool emit_final_state) {
     copy(cb_h_acc, cb_h_prev);
     copy(cb_h_acc, cb_states_out);
     cb_wait_front(cb_h_acc, 1);
@@ -120,6 +122,9 @@ FORCE_INLINE void compute_recurrence_tile(
         mul(cb_a, cb_h_prev, cb_ah);
     }
     sum(cb_ah, cb_x, cb_h);
+    if (emit_final_state) {
+        copy(cb_h, cb_final_state);
+    }
     copy(cb_h, cb_h_acc);
     cb_pop_front(cb_h, 1);
 }
@@ -136,7 +141,7 @@ void kernel_main() {
     // 7: CB index for h
     // 8: CB index for exp(a)
     // 9: CB index for hidden-state accumulator
-    // 10: enable fused recurrence consume/produce path
+    // 10: recurrence kernel ABI version (non-zero enables fused recurrence path)
     constexpr uint32_t states_cb_index = get_compile_time_arg_val(0);
     constexpr uint32_t initial_states_cb_index = get_compile_time_arg_val(1);
     constexpr uint32_t a_end_cb_index = get_compile_time_arg_val(2);
@@ -147,7 +152,7 @@ void kernel_main() {
     constexpr uint32_t h_cb_index = get_compile_time_arg_val(7);
     constexpr uint32_t exp_a_cb_index = get_compile_time_arg_val(8);
     constexpr uint32_t h_acc_cb_index = get_compile_time_arg_val(9);
-    constexpr bool enable_recurrence = get_compile_time_arg_val(10) == 1;
+    constexpr bool enable_recurrence = get_compile_time_arg_val(10) != 0;
 
     // Runtime args:
     // 0-3: chunk count, state dimensions, hidden tiles assigned to this core
@@ -169,6 +174,7 @@ void kernel_main() {
         }
 
         for (uint32_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+            const bool emit_final_state = chunk_idx + 1 == num_chunks;
             for (uint32_t hidden_tile = 0; hidden_tile < hidden_tile_count; ++hidden_tile) {
                 compute_recurrence_tile<true>(
                     a_end_cb_index,
@@ -178,14 +184,10 @@ void kernel_main() {
                     ah_cb_index,
                     h_cb_index,
                     states_out_cb_index,
-                    h_acc_cb_index);
+                    h_acc_cb_index,
+                    final_state_cb_index,
+                    emit_final_state);
             }
-        }
-
-        for (uint32_t hidden_tile = 0; hidden_tile < hidden_tile_count; ++hidden_tile) {
-            copy(h_acc_cb_index, final_state_cb_index);
-            cb_wait_front(h_acc_cb_index, 1);
-            cb_pop_front(h_acc_cb_index, 1);
         }
     }
 
