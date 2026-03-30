@@ -12,6 +12,16 @@ from types import ModuleType
 
 from loguru import logger
 
+# Keep DPRINT forced on while the custom depthwise_conv1d kernel is unstable.
+# This intentionally overrides stale shell exports so every run gets the same
+# reader/compute/writer breadcrumbs without relying on the caller's environment.
+os.environ["TT_METAL_DPRINT_CORES"] = "(0,0),(0,1),(1,0),(1,1)"
+# Leave RISCV selection unset so TT-Metal enables debug prints on all
+# programmable processors. This avoids parser/alias issues while debugging
+# the custom depthwise_conv1d kernel.
+os.environ.pop("TT_METAL_DPRINT_RISCVS", None)
+os.environ["TT_METAL_DPRINT_PREPEND_DEVICE_CORE_RISC"] = "1"
+
 import ttnn._ttnn
 
 
