@@ -51,6 +51,16 @@ void kernel_main() {
     cb_push_back(cb_weight_rm, kernel_size * block_height);
     DPRINT << "dwconv1d reader weight ready" << ENDL();
 
+    if constexpr (has_bias) {
+        cb_reserve_back(cb_bias_rm, block_height);
+        uint32_t bias_write_addr = get_write_ptr(cb_bias_rm);
+        for (uint32_t row = 0; row < block_height; ++row) {
+            noc_async_read_page(0, bias_accessor, bias_write_addr + row * stick_nbytes);
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_bias_rm, block_height);
+    }
+
     for (uint32_t local_block = 0; local_block < num_blocks; ++local_block) {
         const uint32_t block = start_block + local_block;
         const uint32_t batch_idx = block / blocks_per_batch;
@@ -59,38 +69,29 @@ void kernel_main() {
         const uint32_t remaining_rows = sequence_length > start_pos ? (sequence_length - start_pos) : 0;
         const uint32_t valid_rows = remaining_rows < block_height ? remaining_rows : block_height;
 
+        cb_reserve_back(cb_act_rm, kernel_size * block_height);
+        uint32_t act_write_addr = get_write_ptr(cb_act_rm);
         for (uint32_t k = 0; k < kernel_size; ++k) {
-            cb_reserve_back(cb_act_rm, block_height);
-            uint32_t write_addr = get_write_ptr(cb_act_rm);
-
             for (uint32_t row = 0; row < valid_rows; ++row) {
                 const uint32_t input_page = batch_idx * padded_sequence_length + start_pos + row + k;
-                noc_async_read_page(input_page, input_accessor, write_addr + row * stick_nbytes);
+                noc_async_read_page(
+                    input_page, input_accessor, act_write_addr + (k * block_height + row) * stick_nbytes);
             }
-            noc_async_read_barrier();
+        }
+        noc_async_read_barrier();
 
-            if (valid_rows < block_height) {
-                volatile tt_l1_ptr uint16_t* act_block_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(write_addr);
+        if (valid_rows < block_height) {
+            volatile tt_l1_ptr uint16_t* act_block_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(act_write_addr);
+            for (uint32_t k = 0; k < kernel_size; ++k) {
                 for (uint32_t row = valid_rows; row < block_height; ++row) {
-                    auto* row_ptr = act_block_ptr + row * channels;
+                    auto* row_ptr = act_block_ptr + (k * block_height + row) * channels;
                     for (uint32_t c = 0; c < channels; ++c) {
                         row_ptr[c] = 0;
                     }
                 }
             }
-
-            cb_push_back(cb_act_rm, block_height);
         }
-
-        if constexpr (has_bias) {
-            cb_reserve_back(cb_bias_rm, block_height);
-            uint32_t bias_write_addr = get_write_ptr(cb_bias_rm);
-            for (uint32_t row = 0; row < block_height; ++row) {
-                noc_async_read_page(0, bias_accessor, bias_write_addr + row * stick_nbytes);
-            }
-            noc_async_read_barrier();
-            cb_push_back(cb_bias_rm, block_height);
-        }
+        cb_push_back(cb_act_rm, kernel_size * block_height);
 
         if (local_block == 0) {
             DPRINT << "dwconv1d reader first block pushed block=" << block << ENDL();

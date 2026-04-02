@@ -5,10 +5,19 @@
 #include "depthwise_conv1d.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <functional>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
+#include <tt-metalium/constants.hpp>
+
 #include "device/depthwise_conv1d_device_operation.hpp"
+#include "device/depthwise_conv1d_forward_device_operation.hpp"
+#include "ttnn/operations/conv/conv1d/conv1d.hpp"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 #include "ttnn/operations/creation/creation.hpp"
@@ -17,6 +26,9 @@
 #include "ttnn/operations/data_movement/sharded/sharded_to_interleaved/sharded_to_interleaved.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/data_movement/transpose/transpose.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
 
 namespace ttnn::experimental {
 
@@ -103,63 +115,578 @@ Tensor maybe_to_interleaved(const Tensor& tensor, const MemoryConfig& working_me
     return tensor.is_sharded() ? ttnn::sharded_to_interleaved(tensor, working_memory_config) : tensor;
 }
 
-Tensor canonicalize_sequence_input(const Tensor& input_tensor, const MemoryConfig& memory_config, uint32_t features) {
-    TT_FATAL(input_tensor.logical_shape().rank() == 3, "stateful depthwise_conv1d expects input shape [B, L, C]");
-    TT_FATAL(
-        input_tensor.logical_shape()[2] == features,
-        "stateful depthwise_conv1d expected {} features but got input shape {}",
-        features,
-        input_tensor.logical_shape());
-
-    auto input_rm = input_tensor.layout() == Layout::ROW_MAJOR
-                        ? input_tensor
-                        : ttnn::to_layout(input_tensor, Layout::ROW_MAJOR, std::nullopt, memory_config);
-    return ttnn::reshape(
-        maybe_to_interleaved(input_rm, memory_config),
-        ttnn::Shape({input_rm.logical_shape()[0], 1, input_rm.logical_shape()[1], input_rm.logical_shape()[2]}),
-        memory_config);
+bool is_depthwise_conv1d_forward_custom_enabled() {
+    if (const char* value = std::getenv("TTNN_DEPTHWISE_CONV1D_FORWARD_CUSTOM")) {
+        return value[0] != '0';
+    }
+    return true;
 }
 
-Tensor canonicalize_state_input(
-    const std::optional<Tensor>& conv_state,
-    const Tensor& reference_input,
+bool is_depthwise_conv1d_forward_custom_shape_supported(
+    const Tensor& x_prepared,
+    const Tensor& conv_state_tensor,
+    uint32_t batch_size,
     uint32_t features,
-    uint32_t cache_len,
-    const MemoryConfig& memory_config) {
-    const uint32_t batch_size = reference_input.logical_shape()[0];
+    uint32_t kernel_size) {
+    return kernel_size >= 2 && kernel_size <= 4 && batch_size == 32 && features == 544 &&
+           x_prepared.layout() == ttnn::TILE_LAYOUT && conv_state_tensor.layout() == ttnn::TILE_LAYOUT &&
+           x_prepared.dtype() == ttnn::DataType::BFLOAT16 && conv_state_tensor.dtype() == ttnn::DataType::BFLOAT16 &&
+           !x_prepared.is_sharded() && !conv_state_tensor.is_sharded();
+}
 
-    if (!conv_state.has_value()) {
-        return ttnn::zeros(
-            ttnn::Shape({batch_size, 1, cache_len, features}),
-            reference_input.dtype(),
-            Layout::ROW_MAJOR,
-            std::ref(*reference_input.device()),
-            memory_config);
+Tensor cast_to_bfloat16_if_needed(const Tensor& tensor) {
+    Tensor result = tensor;
+    if (result.dtype() == ttnn::DataType::BFLOAT16) {
+        return result;
+    }
+    if (is_cpu_tensor(result)) {
+        return ttnn::to_dtype(result, ttnn::DataType::BFLOAT16);
+    }
+    if (result.layout() == ttnn::ROW_MAJOR_LAYOUT) {
+        result = ttnn::to_layout(result, ttnn::TILE_LAYOUT);
+    }
+    return ttnn::typecast(result, ttnn::DataType::BFLOAT16, result.memory_config());
+}
+
+Tensor cast_to_bfloat16_preserve_layout_if_needed(const Tensor& tensor) {
+    if (tensor.dtype() == ttnn::DataType::BFLOAT16) {
+        return tensor;
+    }
+    if (is_cpu_tensor(tensor)) {
+        return ttnn::to_dtype(tensor, ttnn::DataType::BFLOAT16);
+    }
+    return ttnn::typecast(tensor, ttnn::DataType::BFLOAT16, tensor.memory_config());
+}
+
+struct PreparedTensorCacheKey {
+    std::uint64_t tensor_id;
+    const void* device;
+    uint32_t features;
+    uint32_t kernel_size;
+
+    bool operator==(const PreparedTensorCacheKey& other) const = default;
+};
+
+struct PreparedTensorCacheKeyHash {
+    std::size_t operator()(const PreparedTensorCacheKey& key) const {
+        std::size_t hash = std::hash<std::uint64_t>{}(key.tensor_id);
+        hash ^= std::hash<const void*>{}(key.device) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<uint32_t>{}(key.features) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<uint32_t>{}(key.kernel_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+using PreparedTensorCache = std::unordered_map<PreparedTensorCacheKey, Tensor, PreparedTensorCacheKeyHash>;
+
+PreparedTensorCache& depthwise_weight_cache() {
+    static PreparedTensorCache cache;
+    return cache;
+}
+
+PreparedTensorCache& depthwise_bias_cache() {
+    static PreparedTensorCache cache;
+    return cache;
+}
+
+[[maybe_unused]] PreparedTensorCache& depthwise_custom_weight_cache() {
+    static PreparedTensorCache cache;
+    return cache;
+}
+
+[[maybe_unused]] PreparedTensorCache& depthwise_custom_bias_cache() {
+    static PreparedTensorCache cache;
+    return cache;
+}
+
+PreparedTensorCache& depthwise_causal_weight_cache() {
+    static PreparedTensorCache cache;
+    return cache;
+}
+
+PreparedTensorCache& depthwise_causal_bias_cache() {
+    static PreparedTensorCache cache;
+    return cache;
+}
+
+std::mutex& depthwise_prepare_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+Tensor prepare_depthwise_weight_uncached(
+    const Tensor& weight,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    uint32_t kernel_size,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    auto weight_tensor = weight;
+    if (weight_tensor.storage_type() != StorageType::DEVICE) {
+        weight_tensor = cast_to_bfloat16_if_needed(weight_tensor);
+        weight_tensor = ttnn::to_device(weight_tensor, reference_tensor.device(), ttnn::DRAM_MEMORY_CONFIG);
+    }
+    weight_tensor = cast_to_bfloat16_if_needed(weight_tensor);
+    if (weight_tensor.layout() != ttnn::TILE_LAYOUT) {
+        weight_tensor = ttnn::to_layout(weight_tensor, ttnn::TILE_LAYOUT);
+    }
+    const auto& prepared_shape = weight_tensor.logical_shape();
+    Tensor weight_prepared = weight_tensor;
+    if (prepared_shape.rank() == 4) {
+        weight_prepared =
+            ttnn::reshape(weight_tensor, ttnn::Shape({prepared_shape[0], prepared_shape[1], prepared_shape[3]}), mem);
+    } else if (prepared_shape.rank() != 3) {
+        TT_FATAL(false, "weight must have rank 3 or 4 for depthwise conv1d");
+    }
+    if (weight_prepared.logical_shape()[0] != features || weight_prepared.logical_shape()[2] != kernel_size) {
+        weight_prepared = ttnn::slice(
+            weight_prepared,
+            ttnn::SmallVector<uint32_t>{0, 0, 0},
+            ttnn::SmallVector<uint32_t>{features, weight_prepared.logical_shape()[1], kernel_size},
+            step,
+            mem);
+    }
+    if (weight_prepared.logical_shape()[1] != 1) {
+        weight_prepared = ttnn::slice(
+            weight_prepared,
+            ttnn::SmallVector<uint32_t>{0, 0, 0},
+            ttnn::SmallVector<uint32_t>{features, 1, kernel_size},
+            step,
+            mem);
+    }
+    return ttnn::reshape(weight_prepared, ttnn::Shape({1, features, kernel_size}), mem);
+}
+
+Tensor prepare_depthwise_weight(
+    const Tensor& weight,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    uint32_t kernel_size,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    PreparedTensorCacheKey cache_key{
+        .tensor_id = weight.tensor_id,
+        .device = reference_tensor.device(),
+        .features = features,
+        .kernel_size = kernel_size};
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_weight_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
     }
 
-    TT_FATAL(conv_state->logical_shape().rank() == 3, "conv_state must have shape [B, C, K-1]");
-    TT_FATAL(
-        conv_state->logical_shape()[0] == batch_size && conv_state->logical_shape()[1] == features &&
-            conv_state->logical_shape()[2] == cache_len,
-        "conv_state must have shape [{}, {}, {}], got {}",
-        batch_size,
-        features,
-        cache_len,
-        conv_state->logical_shape());
+    auto prepared = prepare_depthwise_weight_uncached(weight, reference_tensor, features, kernel_size, step, mem);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_weight_cache()[cache_key] = prepared;
+    }
+    return prepared;
+}
 
-    auto state_rm = conv_state->layout() == Layout::ROW_MAJOR
-                        ? *conv_state
-                        : ttnn::to_layout(*conv_state, Layout::ROW_MAJOR, std::nullopt, memory_config);
-    auto state_interleaved = maybe_to_interleaved(state_rm, memory_config);
-    auto state_seq_first = ttnn::transpose(state_interleaved, 1, 2, memory_config);
-    return ttnn::reshape(
-        state_seq_first,
-        ttnn::Shape(
-            {state_seq_first.logical_shape()[0],
-             1,
-             state_seq_first.logical_shape()[1],
-             state_seq_first.logical_shape()[2]}),
-        memory_config);
+Tensor prepare_depthwise_bias_uncached(
+    const Tensor& bias,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    auto bias_tensor = bias;
+    Tensor bias_prepared = bias_tensor;
+    const auto& bias_shape = bias_prepared.logical_shape();
+    if (bias_shape.rank() == 4) {
+        bias_prepared = ttnn::reshape(bias_prepared, ttnn::Shape({bias_shape[0], bias_shape[1], bias_shape[3]}), mem);
+    }
+    if (bias_prepared.logical_shape()[2] != features) {
+        bias_prepared = ttnn::slice(
+            bias_prepared,
+            ttnn::SmallVector<uint32_t>{0, 0, 0},
+            ttnn::SmallVector<uint32_t>{1, 1, features},
+            step,
+            mem);
+    }
+    bias_prepared = cast_to_bfloat16_if_needed(bias_prepared);
+    if (bias_prepared.storage_type() != StorageType::DEVICE) {
+        bias_prepared = ttnn::to_device(bias_prepared, reference_tensor.device(), ttnn::DRAM_MEMORY_CONFIG);
+    }
+    if (bias_prepared.layout() != ttnn::TILE_LAYOUT) {
+        bias_prepared = ttnn::to_layout(bias_prepared, ttnn::TILE_LAYOUT);
+    }
+    return bias_prepared;
+}
+
+Tensor prepare_depthwise_bias(
+    const Tensor& bias,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    PreparedTensorCacheKey cache_key{
+        .tensor_id = bias.tensor_id, .device = reference_tensor.device(), .features = features, .kernel_size = 0};
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_bias_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto prepared = prepare_depthwise_bias_uncached(bias, reference_tensor, features, step, mem);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_bias_cache()[cache_key] = prepared;
+    }
+    return prepared;
+}
+
+Tensor prepare_depthwise_weight_custom_uncached(
+    const Tensor& weight,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    uint32_t kernel_size,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    auto weight_prepared = prepare_depthwise_weight(weight, reference_tensor, features, kernel_size, step, mem);
+    auto weight_4d = ttnn::reshape(weight_prepared, ttnn::Shape({1, 1, features, kernel_size}), mem);
+    auto weight_kf = ttnn::transpose(weight_4d, 2, 3, mem);
+    const auto step_4d = ttnn::SmallVector<uint32_t>{1, 1, 1, 1};
+
+    std::vector<Tensor> tap_tiles;
+    tap_tiles.reserve(kernel_size);
+    for (uint32_t tap = 0; tap < kernel_size; ++tap) {
+        auto tap_row = ttnn::slice(
+            weight_kf,
+            ttnn::SmallVector<uint32_t>{0, 0, tap, 0},
+            ttnn::SmallVector<uint32_t>{1, 1, tap + 1, features},
+            step_4d,
+            mem);
+        auto zero_rows = ttnn::zeros(
+            ttnn::Shape({1, 1, tt::constants::TILE_HEIGHT - 1, features}),
+            weight_kf.dtype(),
+            weight_kf.layout(),
+            std::ref(*reference_tensor.device()),
+            ttnn::DRAM_MEMORY_CONFIG);
+        tap_tiles.push_back(ttnn::concat(std::vector<Tensor>{tap_row, zero_rows}, 2, mem));
+    }
+
+    return ttnn::concat(tap_tiles, 2, mem);
+}
+
+[[maybe_unused]] Tensor prepare_depthwise_weight_custom(
+    const Tensor& weight,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    uint32_t kernel_size,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    PreparedTensorCacheKey cache_key{
+        .tensor_id = weight.tensor_id,
+        .device = reference_tensor.device(),
+        .features = features,
+        .kernel_size = kernel_size};
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_custom_weight_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto prepared =
+        prepare_depthwise_weight_custom_uncached(weight, reference_tensor, features, kernel_size, step, mem);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_custom_weight_cache()[cache_key] = prepared;
+    }
+    return prepared;
+}
+
+Tensor prepare_depthwise_bias_custom_uncached(
+    const Tensor& bias,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    auto bias_prepared = prepare_depthwise_bias(bias, reference_tensor, features, step, mem);
+    auto bias_4d = ttnn::reshape(bias_prepared, ttnn::Shape({1, 1, 1, features}), mem);
+    auto zero_rows = ttnn::zeros(
+        ttnn::Shape({1, 1, tt::constants::TILE_HEIGHT - 1, features}),
+        bias_4d.dtype(),
+        bias_4d.layout(),
+        std::ref(*reference_tensor.device()),
+        ttnn::DRAM_MEMORY_CONFIG);
+    return ttnn::concat(std::vector<Tensor>{bias_4d, zero_rows}, 2, mem);
+}
+
+[[maybe_unused]] Tensor prepare_depthwise_bias_custom(
+    const Tensor& bias,
+    const Tensor& reference_tensor,
+    uint32_t features,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    PreparedTensorCacheKey cache_key{
+        .tensor_id = bias.tensor_id, .device = reference_tensor.device(), .features = features, .kernel_size = 0};
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_custom_bias_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto prepared = prepare_depthwise_bias_custom_uncached(bias, reference_tensor, features, step, mem);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_custom_bias_cache()[cache_key] = prepared;
+    }
+    return prepared;
+}
+
+Tensor prepare_depthwise_weight_causal_uncached(
+    const Tensor& weight, const Tensor& reference_tensor, uint32_t features, uint32_t kernel_size) {
+    auto weight_tensor = weight;
+    if (weight_tensor.storage_type() != StorageType::DEVICE) {
+        weight_tensor = cast_to_bfloat16_preserve_layout_if_needed(weight_tensor);
+        weight_tensor = weight_tensor.to_device(reference_tensor.device(), ttnn::DRAM_MEMORY_CONFIG);
+    }
+    weight_tensor = cast_to_bfloat16_preserve_layout_if_needed(weight_tensor);
+    weight_tensor = maybe_to_interleaved(weight_tensor, ttnn::DRAM_MEMORY_CONFIG);
+    auto weight_causal = normalize_weight(weight_tensor, features, kernel_size);
+    if (weight_causal.layout() != ttnn::ROW_MAJOR_LAYOUT) {
+        weight_causal = ttnn::to_layout(weight_causal, ttnn::ROW_MAJOR_LAYOUT);
+    }
+    weight_causal = cast_to_bfloat16_preserve_layout_if_needed(weight_causal);
+    return weight_causal;
+}
+
+[[maybe_unused]] Tensor prepare_depthwise_weight_causal(
+    const Tensor& weight, const Tensor& reference_tensor, uint32_t features, uint32_t kernel_size) {
+    PreparedTensorCacheKey cache_key{
+        .tensor_id = weight.tensor_id,
+        .device = reference_tensor.device(),
+        .features = features,
+        .kernel_size = kernel_size};
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_causal_weight_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
+    }
+    auto prepared = prepare_depthwise_weight_causal_uncached(weight, reference_tensor, features, kernel_size);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_causal_weight_cache()[cache_key] = prepared;
+    }
+    return prepared;
+}
+
+Tensor prepare_depthwise_bias_causal_uncached(const Tensor& bias, const Tensor& reference_tensor, uint32_t features) {
+    auto bias_tensor = bias;
+    if (bias_tensor.storage_type() != StorageType::DEVICE) {
+        bias_tensor = cast_to_bfloat16_preserve_layout_if_needed(bias_tensor);
+        bias_tensor = bias_tensor.to_device(reference_tensor.device(), ttnn::DRAM_MEMORY_CONFIG);
+    }
+    bias_tensor = cast_to_bfloat16_preserve_layout_if_needed(bias_tensor);
+    bias_tensor = maybe_to_interleaved(bias_tensor, ttnn::DRAM_MEMORY_CONFIG);
+    auto bias_causal = normalize_bias(bias_tensor, features);
+    if (bias_causal.layout() != ttnn::ROW_MAJOR_LAYOUT) {
+        bias_causal = ttnn::to_layout(bias_causal, ttnn::ROW_MAJOR_LAYOUT);
+    }
+    bias_causal = cast_to_bfloat16_preserve_layout_if_needed(bias_causal);
+    return bias_causal;
+}
+
+[[maybe_unused]] Tensor prepare_depthwise_bias_causal(
+    const Tensor& bias, const Tensor& reference_tensor, uint32_t features) {
+    PreparedTensorCacheKey cache_key{
+        .tensor_id = bias.tensor_id, .device = reference_tensor.device(), .features = features, .kernel_size = 0};
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_causal_bias_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
+    }
+    auto prepared = prepare_depthwise_bias_causal_uncached(bias, reference_tensor, features);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_causal_bias_cache()[cache_key] = prepared;
+    }
+    return prepared;
+}
+
+[[maybe_unused]] Tensor build_stateful_causal_padded_input(
+    const Tensor& x_prepared,
+    const Tensor& conv_state_tensor,
+    uint32_t batch_size,
+    uint32_t sequence_length,
+    uint32_t features,
+    uint32_t cache_len,
+    const std::optional<MemoryConfig>& mem) {
+    auto x_rm = x_prepared;
+    if (x_rm.layout() != ttnn::ROW_MAJOR_LAYOUT) {
+        x_rm = ttnn::to_layout(x_rm, ttnn::ROW_MAJOR_LAYOUT);
+    }
+
+    if (cache_len == 0) {
+        return ttnn::reshape(x_rm, ttnn::Shape({batch_size, 1, sequence_length, features}), mem);
+    }
+
+    auto conv_state_prefix = ttnn::transpose(conv_state_tensor, 1, 2, mem);
+    if (conv_state_prefix.layout() != ttnn::ROW_MAJOR_LAYOUT) {
+        conv_state_prefix = ttnn::to_layout(conv_state_prefix, ttnn::ROW_MAJOR_LAYOUT);
+    }
+
+    auto x_padded = ttnn::concat(std::vector<Tensor>{conv_state_prefix, x_rm}, 1, mem);
+    return ttnn::reshape(x_padded, ttnn::Shape({batch_size, 1, sequence_length + cache_len, features}), mem);
+}
+
+Tensor compute_new_conv_state(
+    const Tensor& x_prepared,
+    const Tensor& conv_state_tensor,
+    uint32_t batch_size,
+    uint32_t features,
+    uint32_t cache_len,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    if (cache_len == 0) {
+        return conv_state_tensor;
+    }
+
+    const uint32_t sequence_length = x_prepared.logical_shape()[1];
+    if (sequence_length >= cache_len) {
+        auto x_tail = ttnn::slice(
+            x_prepared,
+            ttnn::SmallVector<uint32_t>{0, sequence_length - cache_len, 0},
+            ttnn::SmallVector<uint32_t>{batch_size, sequence_length, features},
+            step,
+            mem);
+        return ttnn::transpose(x_tail, 1, 2, mem);
+    }
+
+    auto x_t = ttnn::transpose(x_prepared, 1, 2, mem);
+    auto state_tail = ttnn::slice(
+        conv_state_tensor,
+        ttnn::SmallVector<uint32_t>{0, 0, sequence_length},
+        ttnn::SmallVector<uint32_t>{batch_size, features, cache_len},
+        step,
+        mem);
+    return ttnn::concat(std::vector<Tensor>{state_tail, x_t}, 2, mem);
+}
+
+std::vector<Tensor> depthwise_conv1d_update_path(
+    const Tensor& x,
+    const Tensor& x_prepared,
+    const Tensor& conv_state_tensor,
+    const Tensor& weight,
+    const Tensor& bias,
+    uint32_t batch_size,
+    uint32_t features,
+    uint32_t kernel_size,
+    uint32_t cache_len,
+    bool silu_activation,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    auto x_token = ttnn::transpose(x_prepared, 1, 2, mem);
+    Tensor new_conv_state;
+    Tensor conv_window;
+    if (cache_len == 0) {
+        new_conv_state = conv_state_tensor;
+        conv_window = x_token;
+    } else {
+        if (cache_len > 1) {
+            auto trimmed_state = ttnn::slice(
+                conv_state_tensor,
+                ttnn::SmallVector<uint32_t>{0, 0, 1},
+                ttnn::SmallVector<uint32_t>{batch_size, features, cache_len},
+                step,
+                mem);
+            new_conv_state = ttnn::concat(std::vector<Tensor>{trimmed_state, x_token}, 2, mem);
+        } else {
+            new_conv_state = x_token;
+        }
+        conv_window = ttnn::concat(std::vector<Tensor>{conv_state_tensor, x_token}, 2, mem);
+    }
+
+    auto weight_prepared = prepare_depthwise_weight(weight, x, features, kernel_size, step, mem);
+    auto bias_prepared = prepare_depthwise_bias(bias, x, features, step, mem);
+
+    auto weighted = ttnn::multiply(conv_window, weight_prepared, std::nullopt, mem);
+    auto output = ttnn::sum(weighted, std::variant<int, int64_t, SmallVector<int>>(2), true, mem);
+    output = ttnn::transpose(output, 1, 2, mem);
+    output = ttnn::add(output, bias_prepared, std::nullopt, mem);
+    if (silu_activation) {
+        output = ttnn::silu(output, mem);
+    }
+
+    return {output, new_conv_state};
+}
+
+std::vector<Tensor> depthwise_conv1d_forward_path(
+    const Tensor& x,
+    const Tensor& x_prepared,
+    const Tensor& conv_state_tensor,
+    const Tensor& weight,
+    const Tensor& bias,
+    uint32_t batch_size,
+    uint32_t features,
+    uint32_t kernel_size,
+    uint32_t cache_len,
+    bool silu_activation,
+    const ttnn::SmallVector<uint32_t>& step,
+    const std::optional<MemoryConfig>& mem) {
+    auto new_conv_state =
+        compute_new_conv_state(x_prepared, conv_state_tensor, batch_size, features, cache_len, step, mem);
+
+    const bool supported_custom_shape = is_depthwise_conv1d_forward_custom_shape_supported(
+        x_prepared, conv_state_tensor, batch_size, features, kernel_size);
+    const bool force_disable_custom = !is_depthwise_conv1d_forward_custom_enabled();
+
+    if (supported_custom_shape) {
+        TT_FATAL(
+            !force_disable_custom,
+            "depthwise_conv1d fallback is disabled for the supported custom forward shape; "
+            "unset TTNN_DEPTHWISE_CONV1D_FORWARD_CUSTOM=0 to run the causal custom kernel");
+        auto weight_causal = prepare_depthwise_weight_causal(weight, x, features, kernel_size);
+        auto bias_causal = prepare_depthwise_bias_causal(bias, x, features);
+        auto padded_input = build_stateful_causal_padded_input(
+            x_prepared, conv_state_tensor, batch_size, x.logical_shape()[1], features, cache_len, mem);
+        auto output = ttnn::prim::depthwise_conv1d_forward(
+            padded_input, weight_causal, kernel_size, features, x.logical_shape()[1], bias_causal, silu_activation);
+        output = ttnn::reshape(output, ttnn::Shape({1, 1, batch_size * x.logical_shape()[1], features}), mem);
+        if (output.layout() != ttnn::TILE_LAYOUT) {
+            output = ttnn::to_layout(output, ttnn::TILE_LAYOUT);
+        }
+        return {output, new_conv_state};
+    }
+
+    auto conv_state_t = ttnn::transpose(conv_state_tensor, 1, 2, mem);
+    if (conv_state_t.layout() != ttnn::TILE_LAYOUT) {
+        conv_state_t = ttnn::to_layout(conv_state_t, ttnn::TILE_LAYOUT);
+    }
+    auto x_padded = ttnn::concat(std::vector<Tensor>{conv_state_t, x_prepared}, 1, mem);
+    auto output = std::get<Tensor>(ttnn::conv1d(
+        x_padded,
+        weight,
+        x.device(),
+        features,
+        features,
+        x_padded.logical_shape()[0],
+        x_padded.logical_shape()[1],
+        kernel_size,
+        1,
+        std::array<uint32_t, 2>{0, 0},
+        1,
+        features,
+        std::nullopt,
+        bias,
+        std::nullopt,
+        std::nullopt,
+        mem,
+        false,
+        false));
+    return {output, new_conv_state};
 }
 
 }  // namespace
@@ -207,7 +734,7 @@ ttnn::Tensor depthwise_conv1d(
         "depthwise_conv1d device operation requires channels to be a multiple of 32, got {}",
         channels);
 
-    // Prepare padded input: [B, 1, L + K - 1, C]
+    // Causal semantics are guaranteed by prefix-zero padding the input before the custom device op consumes it.
     auto padded_input = canonical_input;
     if (kernel_size > 1) {
         auto zero_prefix = ttnn::zeros(
@@ -236,64 +763,102 @@ ttnn::Tensor depthwise_conv1d(
 }
 
 std::vector<Tensor> depthwise_conv1d(
-    const Tensor& input_tensor,
+    const Tensor& x,
     const std::optional<Tensor>& conv_state,
-    const Tensor& weight_tensor,
-    const Tensor& bias_tensor,
+    const Tensor& weight,
+    const Tensor& bias,
     uint32_t features,
-    uint32_t kernel_size) {
-    TT_FATAL(kernel_size > 0, "kernel_size must be greater than zero");
-    TT_FATAL(input_tensor.device() != nullptr, "stateful depthwise_conv1d expects input_tensor to be on device");
+    uint32_t kernel_size,
+    bool silu_activation) {
+    TT_FATAL(x.device() != nullptr, "x must be on device");
+    TT_FATAL(x.logical_shape().rank() == 3, "x must have shape [B, L, F]");
+    TT_FATAL(weight.layout() == ttnn::ROW_MAJOR_LAYOUT, "weight must be row-major");
+    TT_FATAL(bias.layout() == ttnn::ROW_MAJOR_LAYOUT, "bias must be row-major");
+    TT_FATAL(kernel_size >= 1, "kernel_size must be positive");
+    TT_FATAL(features >= 1, "features must be positive");
 
+    const auto& x_shape = x.logical_shape();
+    const uint32_t batch_size = x_shape[0];
+    const uint32_t sequence_length = x_shape[1];
     const uint32_t cache_len = kernel_size - 1;
-    const MemoryConfig working_memory_config = ttnn::DRAM_MEMORY_CONFIG;
+    const auto mem = std::optional<MemoryConfig>(ttnn::DRAM_MEMORY_CONFIG);
+    const auto step = ttnn::SmallVector<uint32_t>{1, 1, 1};
 
-    auto device_conv_state =
-        ensure_optional_tensor_on_input_device(conv_state, input_tensor, working_memory_config, "conv_state");
-    auto device_weight_tensor =
-        ensure_tensor_on_input_device(weight_tensor, input_tensor, working_memory_config, "weight_tensor");
-    auto device_bias_tensor =
-        ensure_tensor_on_input_device(bias_tensor, input_tensor, working_memory_config, "bias_tensor");
+    TT_FATAL(x_shape[2] >= features, "x feature dimension must be >= features");
 
-    auto canonical_input = canonicalize_sequence_input(input_tensor, working_memory_config, features);
-    auto canonical_state =
-        canonicalize_state_input(device_conv_state, canonical_input, features, cache_len, working_memory_config);
-    auto concatenated_input = ttnn::concat({canonical_state, canonical_input}, 2, working_memory_config);
+    Tensor conv_state_tensor;
+    if (conv_state.has_value()) {
+        conv_state_tensor = conv_state.value();
+    } else {
+        conv_state_tensor = ttnn::zeros(
+            ttnn::Shape({batch_size, features, cache_len}),
+            x.dtype(),
+            ttnn::TILE_LAYOUT,
+            *x.device(),
+            ttnn::DRAM_MEMORY_CONFIG);
+    }
+    TT_FATAL(conv_state_tensor.device() != nullptr, "conv_state must be on device");
+    TT_FATAL(x.device() == conv_state_tensor.device(), "x and conv_state must share a device");
+    TT_FATAL(conv_state_tensor.logical_shape().rank() == 3, "conv_state must have shape [B, F, K-1]");
 
-    auto output = depthwise_conv1d(
-        concatenated_input, device_weight_tensor, kernel_size, true, device_bias_tensor, false, working_memory_config);
+    const auto& state_shape = conv_state_tensor.logical_shape();
+    TT_FATAL(state_shape[0] == batch_size, "conv_state batch must match x batch");
+    TT_FATAL(state_shape[1] >= features, "conv_state feature dimension must be >= features");
+    TT_FATAL(state_shape[2] >= cache_len, "conv_state cache dimension must be >= kernel_size - 1");
 
-    const uint32_t batch_size = canonical_input.logical_shape()[0];
-    const uint32_t sequence_length = canonical_input.logical_shape()[2];
-    const std::array<uint32_t, 4> slice_step = {1, 1, 1, 1};
-    output = ttnn::slice(
-        output,
-        std::array<uint32_t, 4>{0, 0, cache_len, 0},
-        std::array<uint32_t, 4>{batch_size, 1, cache_len + sequence_length, features},
-        slice_step,
-        working_memory_config);
-    output = ttnn::reshape(output, ttnn::Shape({batch_size, sequence_length, features}), working_memory_config);
-
-    auto new_conv_state =
-        cache_len == 0 ? ttnn::reshape(canonical_state, ttnn::Shape({batch_size, features, 0}), working_memory_config)
-                       : ttnn::slice(
-                             concatenated_input,
-                             std::array<uint32_t, 4>{0, 0, sequence_length, 0},
-                             std::array<uint32_t, 4>{batch_size, 1, sequence_length + cache_len, features},
-                             slice_step,
-                             working_memory_config);
-    if (cache_len > 0) {
-        new_conv_state =
-            ttnn::reshape(new_conv_state, ttnn::Shape({batch_size, cache_len, features}), working_memory_config);
-        new_conv_state = ttnn::transpose(new_conv_state, 1, 2, working_memory_config);
+    auto x_prepared = x;
+    if (x_prepared.layout() != ttnn::TILE_LAYOUT) {
+        x_prepared = ttnn::to_layout(x_prepared, ttnn::TILE_LAYOUT);
+    }
+    if (x_prepared.logical_shape()[2] != features) {
+        x_prepared = ttnn::slice(
+            x_prepared,
+            ttnn::SmallVector<uint32_t>{0, 0, 0},
+            ttnn::SmallVector<uint32_t>{batch_size, sequence_length, features},
+            step,
+            mem);
+    }
+    if (conv_state_tensor.layout() != ttnn::TILE_LAYOUT) {
+        conv_state_tensor = ttnn::to_layout(conv_state_tensor, ttnn::TILE_LAYOUT);
+    }
+    if (conv_state_tensor.logical_shape()[1] != features || conv_state_tensor.logical_shape()[2] != cache_len) {
+        conv_state_tensor = ttnn::slice(
+            conv_state_tensor,
+            ttnn::SmallVector<uint32_t>{0, 0, 0},
+            ttnn::SmallVector<uint32_t>{batch_size, features, cache_len},
+            step,
+            mem);
     }
 
-    if (input_tensor.layout() == Layout::TILE) {
-        output = ttnn::to_layout(output, Layout::TILE, std::nullopt, working_memory_config);
-        new_conv_state = ttnn::to_layout(new_conv_state, Layout::TILE, std::nullopt, working_memory_config);
+    if (sequence_length == 1) {
+        return depthwise_conv1d_update_path(
+            x,
+            x_prepared,
+            conv_state_tensor,
+            weight,
+            bias,
+            batch_size,
+            features,
+            kernel_size,
+            cache_len,
+            silu_activation,
+            step,
+            mem);
     }
 
-    return {output, new_conv_state};
+    return depthwise_conv1d_forward_path(
+        x,
+        x_prepared,
+        conv_state_tensor,
+        weight,
+        bias,
+        batch_size,
+        features,
+        kernel_size,
+        cache_len,
+        silu_activation,
+        step,
+        mem);
 }
 
 }  // namespace ttnn::experimental

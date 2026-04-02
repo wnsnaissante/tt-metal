@@ -145,7 +145,7 @@ DepthwiseConv1dDeviceOperation::ProgramFactory::cached_program_t DepthwiseConv1d
         "ttnn/cpp/ttnn/operations/experimental/depthwise_conv1d/device/kernels/compute_causal_depthwise_conv1d.cpp",
         all_cores,
         ComputeConfig{
-            .math_fidelity = MathFidelity::HiFi4,
+            .math_fidelity = MathFidelity::HiFi2,
             .fp32_dest_acc_en = false,
             .math_approx_mode = false,
             .compile_args = compute_ct_args});

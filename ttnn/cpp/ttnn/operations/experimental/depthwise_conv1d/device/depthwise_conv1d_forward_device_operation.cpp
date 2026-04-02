@@ -37,19 +37,23 @@ void DepthwiseConv1dForwardDeviceOperation::validate_on_program_cache_miss(
     const auto& weight_shape = weight.logical_shape();
     const auto& bias_shape = bias.logical_shape();
 
-    TT_FATAL(x_shape.rank() == 3, "x_blf must have shape [B, L_padded, F]");
+    TT_FATAL(x_shape.rank() == 3, "x_blf must have shape [B, L, F]");
     TT_FATAL(state_shape.rank() == 3, "conv_state_bfk must have shape [B, F, K-1]");
-    TT_FATAL(weight_shape.rank() == 3, "weight_1fk must have shape [1, F, K]");
-    TT_FATAL(bias_shape.rank() == 3, "bias_11f must have shape [1, 1, F]");
+    TT_FATAL(weight_shape.rank() == 4, "weight_1fk must have shape [1, 1, K*32, F]");
+    TT_FATAL(bias_shape.rank() == 4, "bias_11f must have shape [1, 1, 32, F]");
     TT_FATAL(x_shape[2] == args.features, "x_blf feature dimension mismatch");
-    TT_FATAL(x_shape[1] >= args.kernel_size, "x_blf sequence dimension must be >= kernel_size");
+    TT_FATAL(x_shape[1] > 0, "x_blf sequence dimension must be positive");
     TT_FATAL(
         state_shape[0] == x_shape[0] && state_shape[1] == args.features && state_shape[2] == args.kernel_size - 1,
         "conv_state_bfk shape mismatch");
     TT_FATAL(
-        weight_shape[0] == 1 && weight_shape[1] == args.features && weight_shape[2] == args.kernel_size,
+        weight_shape[0] == 1 && weight_shape[1] == 1 &&
+            weight_shape[2] == args.kernel_size * tt::constants::TILE_HEIGHT && weight_shape[3] == args.features,
         "weight_1fk shape mismatch");
-    TT_FATAL(bias_shape[0] == 1 && bias_shape[1] == 1 && bias_shape[2] == args.features, "bias_11f shape mismatch");
+    TT_FATAL(
+        bias_shape[0] == 1 && bias_shape[1] == 1 && bias_shape[2] == tt::constants::TILE_HEIGHT &&
+            bias_shape[3] == args.features,
+        "bias_11f shape mismatch");
     TT_FATAL(args.kernel_size >= 2 && args.kernel_size <= 4, "forward custom op currently supports 2 <= k <= 4");
     TT_FATAL(
         args.output_memory_config.buffer_type() == tt::tt_metal::BufferType::DRAM,
@@ -64,9 +68,8 @@ void DepthwiseConv1dForwardDeviceOperation::validate_on_program_cache_hit(
 TensorSpec DepthwiseConv1dForwardDeviceOperation::compute_output_specs(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     const auto& x_shape = tensor_args.x_blf.logical_shape();
-    const uint32_t output_sequence_length = x_shape[1] - (args.kernel_size - 1);
     return TensorSpec(
-        ttnn::Shape({x_shape[0], 1, output_sequence_length, args.features}),
+        ttnn::Shape({x_shape[0], 1, x_shape[1], args.features}),
         tt::tt_metal::TensorLayout(
             tensor_args.x_blf.dtype(), tt::tt_metal::PageConfig(Layout::TILE), args.output_memory_config));
 }

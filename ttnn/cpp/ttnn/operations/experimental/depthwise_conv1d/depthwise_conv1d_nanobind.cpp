@@ -17,10 +17,13 @@ void bind_depthwise_conv1d(nb::module_& mod) {
     ttnn::bind_function<"depthwise_conv1d", "ttnn.experimental.">(
         mod,
         R"doc(
-        Performs a causal depthwise Conv1d on tensors shaped either as [B, 1, L, C] or [B, L, 1, C].
+        Performs causal depthwise Conv1d.
 
-        The current implementation is a halo-free causal reference path built from existing TTNN tensor operations.
-        It accepts weights shaped as [C, 1, K] or [1, 1, C, K].
+        Stateless mode accepts tensors shaped [B, 1, L, C] or [B, L, 1, C] and applies
+        left zero padding to guarantee causal-conv1d semantics.
+
+        Stateful mode accepts [x, conv_state, weight, bias, features, kernel_size] and
+        updates conv_state while preserving the same causal-conv1d semantics for cached flows.
         )doc",
         ttnn::overload_t(
             static_cast<ttnn::Tensor (*)(
@@ -46,13 +49,16 @@ void bind_depthwise_conv1d(nb::module_& mod) {
                 const ttnn::Tensor&,
                 const ttnn::Tensor&,
                 uint32_t,
-                uint32_t)>(&ttnn::experimental::depthwise_conv1d),
+                uint32_t,
+                bool)>(&ttnn::experimental::depthwise_conv1d),
             nb::arg("input_tensor"),
             nb::arg("conv_state") = nb::none(),
             nb::arg("weight_tensor"),
             nb::arg("bias_tensor"),
             nb::arg("features"),
-            nb::arg("kernel_size")));
+            nb::arg("kernel_size"),
+            nb::kw_only(),
+            nb::arg("silu_activation") = false));
 }
 
 }  // namespace ttnn::operations::experimental::depthwise_conv1d::detail

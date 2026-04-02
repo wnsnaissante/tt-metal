@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "api/compute/bcast.h"
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/eltwise_binary.h"
 
@@ -23,6 +24,10 @@ void kernel_main() {
 
     for (uint32_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
         cb_wait_front(kBiasCbIndex, kOneTile);
+        for (uint32_t tap = 0; tap < kernel_size; ++tap) {
+            cb_wait_front(tt::CBIndex::c_4 + tap, kOneTile);
+        }
+
         uint32_t accum_in_cb = kAccumCb0Index;
         uint32_t accum_out_cb = kAccumCb1Index;
 
@@ -31,7 +36,6 @@ void kernel_main() {
             const uint32_t weight_cb = tt::CBIndex::c_4 + tap;
 
             cb_wait_front(input_cb, kOneTile);
-            cb_wait_front(weight_cb, kOneTile);
             const bool first_tap = tap == 0;
 
             if (first_tap) {
@@ -39,8 +43,8 @@ void kernel_main() {
                 pack_reconfig_data_format(accum_in_cb);
 
                 tile_regs_acquire();
-                mul_tiles_init(input_cb, weight_cb);
-                mul_tiles(input_cb, weight_cb, 0, 0, 0);
+                mul_bcast_rows_init_short(input_cb, weight_cb);
+                mul_tiles_bcast_rows(input_cb, weight_cb, 0, 0, 0);
                 tile_regs_commit();
                 tile_regs_wait();
                 pack_tile(0, accum_in_cb);
@@ -48,7 +52,6 @@ void kernel_main() {
                 cb_push_back(accum_in_cb, kOneTile);
 
                 cb_pop_front(input_cb, kOneTile);
-                cb_pop_front(weight_cb, kOneTile);
                 continue;
             }
 
@@ -56,8 +59,8 @@ void kernel_main() {
             pack_reconfig_data_format(kPartialCbIndex);
 
             tile_regs_acquire();
-            mul_tiles_init(input_cb, weight_cb);
-            mul_tiles(input_cb, weight_cb, 0, 0, 0);
+            mul_bcast_rows_init_short(input_cb, weight_cb);
+            mul_tiles_bcast_rows(input_cb, weight_cb, 0, 0, 0);
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, kPartialCbIndex);
@@ -65,7 +68,6 @@ void kernel_main() {
             cb_push_back(kPartialCbIndex, kOneTile);
 
             cb_pop_front(input_cb, kOneTile);
-            cb_pop_front(weight_cb, kOneTile);
 
             cb_wait_front(kPartialCbIndex, kOneTile);
             cb_wait_front(accum_in_cb, kOneTile);
@@ -93,8 +95,8 @@ void kernel_main() {
         cb_reserve_back(kOutputCbIndex, kOneTile);
         pack_reconfig_data_format(kOutputCbIndex);
         tile_regs_acquire();
-        add_tiles_init(accum_in_cb, kBiasCbIndex);
-        add_tiles(accum_in_cb, kBiasCbIndex, 0, 0, 0);
+        add_bcast_rows_init_short(accum_in_cb, kBiasCbIndex);
+        add_tiles_bcast_rows(accum_in_cb, kBiasCbIndex, 0, 0, 0);
         tile_regs_commit();
         tile_regs_wait();
         pack_tile(0, kOutputCbIndex);
@@ -102,6 +104,10 @@ void kernel_main() {
 
         cb_push_back(kOutputCbIndex, kOneTile);
         cb_pop_front(accum_in_cb, kOneTile);
+
+        for (uint32_t tap = 0; tap < kernel_size; ++tap) {
+            cb_pop_front(tt::CBIndex::c_4 + tap, kOneTile);
+        }
         cb_pop_front(kBiasCbIndex, kOneTile);
     }
 }

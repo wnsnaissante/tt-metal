@@ -691,9 +691,8 @@ target_link_libraries(
         TTNN::Ops::Experimental::CCL
         TTNN::Ops::Experimental::CNN
         TTNN::Ops::Experimental::Conv3d
-        TTNN::Ops::Experimental::DepthwiseConv1d
         TTNN::Ops::Experimental::Copy
-        TTNN::Ops::Experimental::DepthwiseConv1d
+        TTNN::Ops::Experimental::DepthwiseConv1dV2
         TTNN::Ops::Experimental::Dropout
         TTNN::Ops::Experimental::IsIn
         TTNN::Ops::Experimental::Mamba
@@ -944,7 +943,6 @@ add_subdirectory(cpp/ttnn/operations/experimental/bcast_to)
 add_subdirectory(cpp/ttnn/operations/experimental/ccl)
 add_subdirectory(cpp/ttnn/operations/experimental/cnn)
 add_subdirectory(cpp/ttnn/operations/experimental/conv3d)
-add_subdirectory(cpp/ttnn/operations/experimental/depthwiseconv1d)
 add_subdirectory(cpp/ttnn/operations/experimental/copy)
 add_subdirectory(cpp/ttnn/operations/experimental/depthwise_conv1d)
 add_subdirectory(cpp/ttnn/operations/experimental/deepseek_moe_post_combine_tilize)
