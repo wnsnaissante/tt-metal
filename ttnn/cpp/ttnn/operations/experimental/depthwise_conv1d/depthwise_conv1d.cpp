@@ -34,49 +34,6 @@ namespace ttnn::experimental {
 
 namespace {
 
-Tensor ensure_tensor_on_input_device(
-    const Tensor& tensor, const Tensor& input_tensor, const MemoryConfig& memory_config, std::string_view tensor_name) {
-    TT_FATAL(input_tensor.device() != nullptr, "depthwise_conv1d expects input_tensor to be on device");
-
-    if (tensor.device() == nullptr) {
-        return tensor.to_device(input_tensor.device(), memory_config);
-    }
-
-    TT_FATAL(
-        tensor.device() == input_tensor.device(),
-        "depthwise_conv1d expects {} to be on the same device as input_tensor",
-        tensor_name);
-    return tensor;
-}
-
-std::optional<Tensor> ensure_optional_tensor_on_input_device(
-    const std::optional<Tensor>& tensor,
-    const Tensor& input_tensor,
-    const MemoryConfig& memory_config,
-    std::string_view tensor_name) {
-    if (!tensor.has_value()) {
-        return std::nullopt;
-    }
-    return ensure_tensor_on_input_device(*tensor, input_tensor, memory_config, tensor_name);
-}
-
-Tensor normalize_input(const Tensor& input_tensor, bool& restore_hw_layout) {
-    const auto& shape = input_tensor.logical_shape();
-    TT_FATAL(shape.rank() == 4, "depthwise_conv1d expects a rank-4 input tensor");
-    TT_FATAL(shape[3] > 0, "depthwise_conv1d expects a non-zero channel dimension");
-    TT_FATAL(
-        shape[1] == 1 || shape[2] == 1,
-        "depthwise_conv1d expects input shape [B, 1, L, C] or [B, L, 1, C], got {}",
-        shape);
-
-    restore_hw_layout = shape[1] != 1;
-    if (!restore_hw_layout) {
-        return input_tensor;
-    }
-
-    return ttnn::reshape(input_tensor, ttnn::Shape({shape[0], 1, shape[1], shape[3]}));
-}
-
 Tensor normalize_weight(const Tensor& weight_tensor, uint32_t channels, uint32_t kernel_size) {
     const auto& shape = weight_tensor.logical_shape();
     TT_FATAL(shape.rank() == 3 || shape.rank() == 4, "depthwise_conv1d expects rank-3 or rank-4 weights");
@@ -720,77 +677,6 @@ std::vector<Tensor> depthwise_conv1d_forward_path(
 }
 
 }  // namespace
-
-ttnn::Tensor depthwise_conv1d(
-    const Tensor& input_tensor,
-    const Tensor& weight_tensor,
-    uint32_t kernel_size,
-    bool causal,
-    const std::optional<Tensor>& bias,
-    bool silu_activation,
-    const std::optional<MemoryConfig>& memory_config) {
-    TT_FATAL(kernel_size > 0, "kernel_size must be greater than zero");
-    TT_FATAL(causal, "depthwise_conv1d currently supports only causal=True");
-    TT_FATAL(input_tensor.device() != nullptr, "depthwise_conv1d expects input_tensor to be on device");
-
-    const auto requested_memory_config = memory_config.value_or(input_tensor.memory_config());
-    const MemoryConfig working_memory_config =
-        (input_tensor.is_sharded() || weight_tensor.is_sharded() || requested_memory_config.is_sharded())
-            ? ttnn::DRAM_MEMORY_CONFIG
-            : requested_memory_config;
-
-    auto device_weight_tensor =
-        ensure_tensor_on_input_device(weight_tensor, input_tensor, working_memory_config, "weight_tensor");
-    auto device_bias_tensor = ensure_optional_tensor_on_input_device(bias, input_tensor, working_memory_config, "bias");
-
-    bool restore_hw_layout = false;
-    auto canonical_input =
-        normalize_input(maybe_to_interleaved(input_tensor, working_memory_config), restore_hw_layout);
-    const auto& canonical_shape = canonical_input.logical_shape();
-    const uint32_t batch_size = canonical_shape[0];
-    const uint32_t sequence_length = canonical_shape[2];
-    const uint32_t channels = canonical_shape[3];
-
-    auto canonical_weight =
-        normalize_weight(maybe_to_interleaved(device_weight_tensor, working_memory_config), channels, kernel_size);
-
-    std::optional<Tensor> canonical_bias = std::nullopt;
-    if (device_bias_tensor.has_value()) {
-        canonical_bias = normalize_bias(maybe_to_interleaved(*device_bias_tensor, working_memory_config), channels);
-    }
-
-    TT_FATAL(
-        channels % 32 == 0,
-        "depthwise_conv1d device operation requires channels to be a multiple of 32, got {}",
-        channels);
-
-    // Causal semantics are guaranteed by prefix-zero padding the input before the custom device op consumes it.
-    auto padded_input = canonical_input;
-    if (kernel_size > 1) {
-        auto zero_prefix = ttnn::zeros(
-            ttnn::Shape({batch_size, 1, kernel_size - 1, channels}),
-            canonical_input.dtype(),
-            canonical_input.layout(),
-            std::ref(*canonical_input.device()),
-            working_memory_config);
-        padded_input = ttnn::concat({zero_prefix, canonical_input}, 2, working_memory_config);
-    }
-
-    auto output = ttnn::prim::depthwise_conv1d_forward(
-        padded_input, canonical_weight, kernel_size, channels, sequence_length, canonical_bias, silu_activation);
-
-    if (restore_hw_layout) {
-        const auto& original_shape = input_tensor.logical_shape();
-        output = ttnn::reshape(
-            output, ttnn::Shape({original_shape[0], original_shape[1], original_shape[2], original_shape[3]}));
-    }
-
-    if (output.memory_config() != requested_memory_config) {
-        output = ttnn::to_memory_config(output, requested_memory_config);
-    }
-
-    return output;
-}
 
 std::vector<Tensor> depthwise_conv1d(
     const Tensor& x,
