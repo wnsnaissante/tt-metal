@@ -9,8 +9,6 @@ target_sources(
     PRIVATE
         depthwise_conv1d.cpp
         device/depthwise_conv1d_device_operation.cpp
-        device/depthwise_conv1d_forward_device_operation.cpp
-        device/depthwise_conv1d_forward_program_factory.cpp
         device/depthwise_conv1d_program_factory.cpp
 )
 

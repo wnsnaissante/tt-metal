@@ -15,7 +15,6 @@
 #include <tt-metalium/constants.hpp>
 
 #include "device/depthwise_conv1d_device_operation.hpp"
-#include "device/depthwise_conv1d_forward_device_operation.hpp"
 #include "ttnn/operations/conv/conv1d/conv1d.hpp"
 #include "ttnn/operations/conv/conv2d/prepare_conv2d_weights.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
@@ -227,16 +226,6 @@ PreparedTensorCache& depthwise_weight_cache() {
 }
 
 PreparedTensorCache& depthwise_bias_cache() {
-    static PreparedTensorCache cache;
-    return cache;
-}
-
-[[maybe_unused]] PreparedTensorCache& depthwise_custom_weight_cache() {
-    static PreparedTensorCache cache;
-    return cache;
-}
-
-[[maybe_unused]] PreparedTensorCache& depthwise_custom_bias_cache() {
     static PreparedTensorCache cache;
     return cache;
 }
@@ -482,109 +471,6 @@ Tensor prepare_depthwise_bias(
     return prepared;
 }
 
-Tensor prepare_depthwise_weight_custom_uncached(
-    const Tensor& weight,
-    const Tensor& reference_tensor,
-    uint32_t features,
-    uint32_t kernel_size,
-    const ttnn::SmallVector<uint32_t>& step,
-    const std::optional<MemoryConfig>& mem) {
-    auto weight_prepared = prepare_depthwise_weight(weight, reference_tensor, features, kernel_size, step, mem);
-    auto weight_4d = ttnn::reshape(weight_prepared, ttnn::Shape({1, 1, features, kernel_size}), mem);
-    auto weight_kf = ttnn::transpose(weight_4d, 2, 3, mem);
-    const auto step_4d = ttnn::SmallVector<uint32_t>{1, 1, 1, 1};
-
-    std::vector<Tensor> tap_tiles;
-    tap_tiles.reserve(kernel_size);
-    for (uint32_t tap = 0; tap < kernel_size; ++tap) {
-        auto tap_row = ttnn::slice(
-            weight_kf,
-            ttnn::SmallVector<uint32_t>{0, 0, tap, 0},
-            ttnn::SmallVector<uint32_t>{1, 1, tap + 1, features},
-            step_4d,
-            mem);
-        auto zero_rows = ttnn::zeros(
-            ttnn::Shape({1, 1, tt::constants::TILE_HEIGHT - 1, features}),
-            weight_kf.dtype(),
-            weight_kf.layout(),
-            std::ref(*reference_tensor.device()),
-            ttnn::DRAM_MEMORY_CONFIG);
-        tap_tiles.push_back(ttnn::concat(std::vector<Tensor>{tap_row, zero_rows}, 2, mem));
-    }
-
-    return ttnn::concat(tap_tiles, 2, mem);
-}
-
-[[maybe_unused]] Tensor prepare_depthwise_weight_custom(
-    const Tensor& weight,
-    const Tensor& reference_tensor,
-    uint32_t features,
-    uint32_t kernel_size,
-    const ttnn::SmallVector<uint32_t>& step,
-    const std::optional<MemoryConfig>& mem) {
-    PreparedTensorCacheKey cache_key{
-        .tensor_id = weight.tensor_id,
-        .device = reference_tensor.device(),
-        .features = features,
-        .kernel_size = kernel_size};
-    {
-        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
-        auto& cache = depthwise_custom_weight_cache();
-        if (auto it = cache.find(cache_key); it != cache.end()) {
-            return it->second;
-        }
-    }
-
-    auto prepared =
-        prepare_depthwise_weight_custom_uncached(weight, reference_tensor, features, kernel_size, step, mem);
-    {
-        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
-        depthwise_custom_weight_cache()[cache_key] = prepared;
-    }
-    return prepared;
-}
-
-Tensor prepare_depthwise_bias_custom_uncached(
-    const Tensor& bias,
-    const Tensor& reference_tensor,
-    uint32_t features,
-    const ttnn::SmallVector<uint32_t>& step,
-    const std::optional<MemoryConfig>& mem) {
-    auto bias_prepared = prepare_depthwise_bias(bias, reference_tensor, features, step, mem);
-    auto bias_4d = ttnn::reshape(bias_prepared, ttnn::Shape({1, 1, 1, features}), mem);
-    auto zero_rows = ttnn::zeros(
-        ttnn::Shape({1, 1, tt::constants::TILE_HEIGHT - 1, features}),
-        bias_4d.dtype(),
-        bias_4d.layout(),
-        std::ref(*reference_tensor.device()),
-        ttnn::DRAM_MEMORY_CONFIG);
-    return ttnn::concat(std::vector<Tensor>{bias_4d, zero_rows}, 2, mem);
-}
-
-[[maybe_unused]] Tensor prepare_depthwise_bias_custom(
-    const Tensor& bias,
-    const Tensor& reference_tensor,
-    uint32_t features,
-    const ttnn::SmallVector<uint32_t>& step,
-    const std::optional<MemoryConfig>& mem) {
-    PreparedTensorCacheKey cache_key{
-        .tensor_id = bias.tensor_id, .device = reference_tensor.device(), .features = features, .kernel_size = 0};
-    {
-        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
-        auto& cache = depthwise_custom_bias_cache();
-        if (auto it = cache.find(cache_key); it != cache.end()) {
-            return it->second;
-        }
-    }
-
-    auto prepared = prepare_depthwise_bias_custom_uncached(bias, reference_tensor, features, step, mem);
-    {
-        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
-        depthwise_custom_bias_cache()[cache_key] = prepared;
-    }
-    return prepared;
-}
-
 Tensor prepare_depthwise_weight_causal_uncached(
     const Tensor& weight, const Tensor& reference_tensor, uint32_t features, uint32_t kernel_size) {
     auto weight_tensor = weight;
@@ -797,7 +683,7 @@ std::vector<Tensor> depthwise_conv1d_forward_path(
             x_prepared, conv_state_tensor, batch_size, x.logical_shape()[1], features, cache_len, mem);
         auto output = ttnn::prim::depthwise_conv1d_forward(
             padded_input, weight_causal, kernel_size, features, x.logical_shape()[1], bias_causal, silu_activation);
-        output = ttnn::reshape(output, ttnn::Shape({1, 1, batch_size * x.logical_shape()[1], features}), mem);
+        output = ttnn::reshape(output, ttnn::Shape({batch_size, x.logical_shape()[1], features}), mem);
         if (output.layout() != ttnn::TILE_LAYOUT) {
             output = ttnn::to_layout(output, ttnn::TILE_LAYOUT);
         }
