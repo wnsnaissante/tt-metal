@@ -17,6 +17,7 @@
 #include "device/depthwise_conv1d_device_operation.hpp"
 #include "device/depthwise_conv1d_forward_device_operation.hpp"
 #include "ttnn/operations/conv/conv1d/conv1d.hpp"
+#include "ttnn/operations/conv/conv2d/prepare_conv2d_weights.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
@@ -179,6 +180,47 @@ struct PreparedTensorCacheKeyHash {
 
 using PreparedTensorCache = std::unordered_map<PreparedTensorCacheKey, Tensor, PreparedTensorCacheKeyHash>;
 
+struct PreparedFallbackConvCacheKey {
+    std::uint64_t weight_tensor_id;
+    std::uint64_t bias_tensor_id;
+    const void* device;
+    uint32_t batch_size;
+    uint32_t input_width;
+    uint32_t features;
+    uint32_t kernel_size;
+    DataType input_dtype;
+    Layout input_layout;
+    BufferType input_buffer_type;
+    TensorMemoryLayout input_memory_layout;
+
+    bool operator==(const PreparedFallbackConvCacheKey& other) const = default;
+};
+
+struct PreparedFallbackConvCacheKeyHash {
+    std::size_t operator()(const PreparedFallbackConvCacheKey& key) const {
+        std::size_t hash = std::hash<std::uint64_t>{}(key.weight_tensor_id);
+        hash ^= std::hash<std::uint64_t>{}(key.bias_tensor_id) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<const void*>{}(key.device) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<uint32_t>{}(key.batch_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<uint32_t>{}(key.input_width) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<uint32_t>{}(key.features) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<uint32_t>{}(key.kernel_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(static_cast<int>(key.input_dtype)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(static_cast<int>(key.input_layout)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(static_cast<int>(key.input_buffer_type)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(static_cast<int>(key.input_memory_layout)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+struct PreparedFallbackConvTensors {
+    Tensor weight;
+    Tensor bias;
+};
+
+using PreparedFallbackConvCache =
+    std::unordered_map<PreparedFallbackConvCacheKey, PreparedFallbackConvTensors, PreparedFallbackConvCacheKeyHash>;
+
 PreparedTensorCache& depthwise_weight_cache() {
     static PreparedTensorCache cache;
     return cache;
@@ -212,6 +254,107 @@ PreparedTensorCache& depthwise_causal_bias_cache() {
 std::mutex& depthwise_prepare_cache_mutex() {
     static std::mutex mutex;
     return mutex;
+}
+
+PreparedFallbackConvCache& depthwise_fallback_conv_cache() {
+    static PreparedFallbackConvCache cache;
+    return cache;
+}
+
+PreparedFallbackConvCacheKey create_prepared_fallback_conv_cache_key(
+    const Tensor& weight, const Tensor& bias, const Tensor& x_padded, uint32_t features, uint32_t kernel_size) {
+    const auto& memory_config = x_padded.memory_config();
+    return PreparedFallbackConvCacheKey{
+        .weight_tensor_id = weight.tensor_id,
+        .bias_tensor_id = bias.tensor_id,
+        .device = x_padded.device(),
+        .batch_size = static_cast<uint32_t>(x_padded.logical_shape()[0]),
+        .input_width = static_cast<uint32_t>(x_padded.logical_shape()[1]),
+        .features = features,
+        .kernel_size = kernel_size,
+        .input_dtype = x_padded.dtype(),
+        .input_layout = x_padded.layout(),
+        .input_buffer_type = memory_config.buffer_type(),
+        .input_memory_layout = memory_config.memory_layout()};
+}
+
+PreparedFallbackConvTensors prepare_fallback_conv_tensors_uncached(
+    const Tensor& weight, const Tensor& bias, const Tensor& x_padded, uint32_t features, uint32_t kernel_size) {
+    using namespace ttnn::operations::conv::conv2d;
+
+    const auto batch_size = static_cast<uint32_t>(x_padded.logical_shape()[0]);
+    const auto input_width = static_cast<uint32_t>(x_padded.logical_shape()[1]);
+    const auto slice_config = std::optional<const ttnn::prim::Conv2dSliceConfig>(
+        ttnn::prim::Conv2dSliceConfig{.slice_type = ttnn::prim::Conv2dSliceConfig::SliceType::L1_FULL});
+    ttnn::prim::Conv2dConfig conv_config;
+    conv_config.weights_dtype = weight.dtype();
+
+    auto prepared_weight = prepare_conv_weights(
+        weight,
+        x_padded.memory_config(),
+        x_padded.layout(),
+        "OIHW",
+        features,
+        features,
+        batch_size,
+        1,
+        input_width,
+        std::array<uint32_t, 2>{1, kernel_size},
+        std::array<uint32_t, 2>{1, 1},
+        std::array<uint32_t, 2>{0, 0},
+        std::array<uint32_t, 2>{1, 1},
+        true,
+        features,
+        x_padded.device(),
+        x_padded.dtype(),
+        std::nullopt,
+        conv_config,
+        std::nullopt,
+        slice_config);
+
+    conv_config.weights_dtype = prepared_weight.dtype();
+
+    auto prepared_bias = prepare_conv_bias(
+        bias,
+        x_padded.memory_config(),
+        x_padded.layout(),
+        features,
+        features,
+        batch_size,
+        1,
+        input_width,
+        std::array<uint32_t, 2>{1, kernel_size},
+        std::array<uint32_t, 2>{1, 1},
+        std::array<uint32_t, 2>{0, 0},
+        std::array<uint32_t, 2>{1, 1},
+        features,
+        x_padded.device(),
+        x_padded.dtype(),
+        std::nullopt,
+        conv_config,
+        std::nullopt,
+        slice_config);
+
+    return PreparedFallbackConvTensors{.weight = std::move(prepared_weight), .bias = std::move(prepared_bias)};
+}
+
+PreparedFallbackConvTensors prepare_fallback_conv_tensors(
+    const Tensor& weight, const Tensor& bias, const Tensor& x_padded, uint32_t features, uint32_t kernel_size) {
+    const auto cache_key = create_prepared_fallback_conv_cache_key(weight, bias, x_padded, features, kernel_size);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        auto& cache = depthwise_fallback_conv_cache();
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto prepared = prepare_fallback_conv_tensors_uncached(weight, bias, x_padded, features, kernel_size);
+    {
+        std::lock_guard<std::mutex> lock(depthwise_prepare_cache_mutex());
+        depthwise_fallback_conv_cache()[cache_key] = prepared;
+    }
+    return prepared;
 }
 
 Tensor prepare_depthwise_weight_uncached(
@@ -666,9 +809,10 @@ std::vector<Tensor> depthwise_conv1d_forward_path(
         conv_state_t = ttnn::to_layout(conv_state_t, ttnn::TILE_LAYOUT);
     }
     auto x_padded = ttnn::concat(std::vector<Tensor>{conv_state_t, x_prepared}, 1, mem);
+    auto prepared_conv_tensors = prepare_fallback_conv_tensors(weight, bias, x_padded, features, kernel_size);
     auto output = std::get<Tensor>(ttnn::conv1d(
         x_padded,
-        weight,
+        prepared_conv_tensors.weight,
         x.device(),
         features,
         features,
@@ -680,7 +824,7 @@ std::vector<Tensor> depthwise_conv1d_forward_path(
         1,
         features,
         std::nullopt,
-        bias,
+        prepared_conv_tensors.bias,
         std::nullopt,
         std::nullopt,
         mem,
