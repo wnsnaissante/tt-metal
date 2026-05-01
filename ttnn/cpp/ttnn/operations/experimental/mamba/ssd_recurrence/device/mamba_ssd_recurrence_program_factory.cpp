@@ -15,6 +15,17 @@ namespace ttnn::experimental::prim {
 
 namespace {
 
+constexpr uint32_t kDTypeBFloat16 = 0;
+constexpr uint32_t kDTypeFloat32 = 1;
+
+uint32_t encode_supported_dtype(const Tensor& tensor) {
+    switch (tensor.dtype()) {
+        case ttnn::DataType::BFLOAT16: return kDTypeBFloat16;
+        case ttnn::DataType::FLOAT32: return kDTypeFloat32;
+        default: TT_THROW("mamba_ssd_recurrence kernel supports BF16/FLOAT32 inputs only");
+    }
+}
+
 struct HiddenTileWorkSplit {
     uint32_t num_cores = 0;
     uint32_t num_cores_y = 0;
@@ -90,6 +101,8 @@ MambaSSDRecurrenceProgramFactory::cached_program_t MambaSSDRecurrenceProgramFact
     const auto a_end_tile_size = tt::tile_size(a_end_data_format);
     const auto states_out_tile_size = tt::tile_size(states_out_data_format);
     const auto final_state_tile_size = tt::tile_size(final_state_data_format);
+    const auto fp32_tile_data_format = tt::DataFormat::Float32;
+    const auto fp32_tile_size = tt::tile_size(fp32_tile_data_format);
     const auto intermediary_data_format = tt::DataFormat::Float16_b;
     const auto intermediary_tile_size = tt::tile_size(intermediary_data_format);
 
@@ -121,8 +134,8 @@ MambaSSDRecurrenceProgramFactory::cached_program_t MambaSSDRecurrenceProgramFact
     tt::tt_metal::CreateCircularBuffer(
         program,
         work_split.all_cores,
-        tt::tt_metal::CircularBufferConfig(a_end_tile_size, {{a_end_cb_index, a_end_data_format}})
-            .set_page_size(a_end_cb_index, a_end_tile_size));
+        tt::tt_metal::CircularBufferConfig(fp32_tile_size, {{a_end_cb_index, fp32_tile_data_format}})
+            .set_page_size(a_end_cb_index, fp32_tile_size));
     tt::tt_metal::CreateCircularBuffer(
         program,
         work_split.all_cores,
@@ -165,8 +178,12 @@ MambaSSDRecurrenceProgramFactory::cached_program_t MambaSSDRecurrenceProgramFact
             max_hidden_tiles_per_core * intermediary_tile_size, {{h_acc_cb_index, intermediary_data_format}})
             .set_page_size(h_acc_cb_index, intermediary_tile_size));
 
-    auto reader_compile_args =
-        std::vector<uint32_t>{states_cb_index, initial_states_cb_index, a_end_cb_index, a_end_scratch_cb_index};
+    auto reader_compile_args = std::vector<uint32_t>{
+        states_cb_index,
+        initial_states_cb_index,
+        a_end_cb_index,
+        a_end_scratch_cb_index,
+        encode_supported_dtype(a_end_bhc)};
     const auto compute_compile_args = std::vector<uint32_t>{
         states_cb_index,
         initial_states_cb_index,

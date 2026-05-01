@@ -66,7 +66,9 @@
 #include "ttnn/operations/experimental/deepseek_prefill/masked_bincount/masked_bincount_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/offset_cumsum/offset_cumsum_nanobind.hpp"
 #include "ttnn/operations/experimental/depthwise_conv1d/depthwise_conv1d_nanobind.hpp"
-#include "ttnn/operations/experimental/mamba/mamba_ssd_recurrence_nanobind.hpp"
+#include "ttnn/operations/experimental/mamba/ssd_output/mamba_ssd_output_nanobind.hpp"
+#include "ttnn/operations/experimental/mamba/ssd_recurrence/mamba_ssd_recurrence_nanobind.hpp"
+#include "ttnn/operations/experimental/mamba/ssd_chunk_scan/mamba_ssd_chunk_scan_nanobind.hpp"
 
 namespace ttnn::operations::experimental {
 
@@ -110,7 +112,9 @@ void py_module(nb::module_& mod) {
     ssm::detail::bind_repeat_and_interleave_eltwise_mul(mod);
     ssm::detail::bind_hc_sum_reduce(mod);
     depthwise_conv1d::detail::bind_depthwise_conv1d(mod);
+    mamba::detail::bind_mamba_ssd_output(mod);
     mamba::detail::bind_mamba_ssd_recurrence(mod);
+    mamba::detail::bind_mamba_ssd_chunk_scan(mod);
 
     cnn::detail::bind_convert_to_chw(mod);
     cnn::detail::bind_convert_to_hwc(mod);

@@ -46,6 +46,7 @@ std::vector<Tensor> mamba_ssd_recurrence(
     const Tensor& states_bhcpn,
     const Tensor& initial_states,
     const Tensor& a_end_bhc,
-    std::optional<CoreGrid> core_grid = std::nullopt);
+    std::optional<CoreGrid> core_grid = std::nullopt,
+    const std::optional<MemoryConfig>& memory_config = std::nullopt);
 
 }  // namespace ttnn::prim

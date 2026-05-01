@@ -11,6 +11,8 @@ constexpr uint32_t TILE_WIDTH = 32;
 constexpr uint32_t TILE_HW = TILE_HEIGHT * TILE_WIDTH;
 constexpr uint32_t FACE_HEIGHT = 16;
 constexpr uint32_t FACE_WIDTH = 16;
+constexpr uint32_t DTYPE_BFLOAT16 = 0;
+constexpr uint32_t DTYPE_FLOAT32 = 1;
 
 FORCE_INLINE uint32_t get_tilized_idx(uint32_t h, uint32_t w) {
     h = h % TILE_HEIGHT;
@@ -27,6 +29,26 @@ FORCE_INLINE uint32_t get_tilized_idx(uint32_t h, uint32_t w) {
     idx += h * FACE_WIDTH + w;
     return idx;
 }
+
+FORCE_INLINE float bits_to_float(uint32_t bits) {
+    union {
+        uint32_t u;
+        float f;
+    } cast{};
+    cast.u = bits;
+    return cast.f;
+}
+
+FORCE_INLINE uint32_t float_to_bits(float value) {
+    union {
+        uint32_t u;
+        float f;
+    } cast{};
+    cast.f = value;
+    return cast.u;
+}
+
+FORCE_INLINE float bfloat16_to_float(uint16_t bf16) { return bits_to_float(static_cast<uint32_t>(bf16) << 16); }
 
 FORCE_INLINE uint32_t states_tile_id(
     uint32_t batch_idx,
@@ -93,11 +115,22 @@ FORCE_INLINE void fill_broadcast_tile_from_scalar(uint32_t cb_id, uint32_t scala
     cb_push_back(cb_id, 1);
 }
 
+FORCE_INLINE float read_tile_scalar(uint32_t l1_addr, uint32_t dtype, uint32_t row, uint32_t col) {
+    const uint32_t idx = get_tilized_idx(row, col);
+    if (dtype == DTYPE_FLOAT32) {
+        const volatile tt_l1_ptr uint32_t* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_addr);
+        return bits_to_float(ptr[idx]);
+    }
+    const volatile tt_l1_ptr uint16_t* ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_addr);
+    return bfloat16_to_float(ptr[idx]);
+}
+
 void kernel_main() {
     constexpr uint32_t states_cb_index = get_compile_time_arg_val(0);
     constexpr uint32_t initial_states_cb_index = get_compile_time_arg_val(1);
     constexpr uint32_t a_end_cb_index = get_compile_time_arg_val(2);
     constexpr uint32_t a_end_scratch_cb_index = get_compile_time_arg_val(3);
+    constexpr uint32_t a_end_dtype = get_compile_time_arg_val(4);
 
     const uint32_t states_addr = get_arg_val<uint32_t>(0);
     const uint32_t initial_states_addr = get_arg_val<uint32_t>(1);
@@ -110,13 +143,13 @@ void kernel_main() {
     const uint32_t hidden_tile_start = get_arg_val<uint32_t>(8);
     const uint32_t hidden_tile_count = get_arg_val<uint32_t>(9);
 
-    const uint32_t tile_size_bytes = get_tile_size(states_cb_index);
-    constexpr auto states_args = TensorAccessorArgs<4>();
-    const auto states = TensorAccessor(states_args, states_addr, tile_size_bytes);
+    constexpr auto states_args = TensorAccessorArgs<5>();
+    const auto states = TensorAccessor(states_args, states_addr, get_tile_size(states_cb_index));
     constexpr auto initial_states_args = TensorAccessorArgs<states_args.next_compile_time_args_offset()>();
-    const auto initial_states = TensorAccessor(initial_states_args, initial_states_addr, tile_size_bytes);
+    const auto initial_states =
+        TensorAccessor(initial_states_args, initial_states_addr, get_tile_size(initial_states_cb_index));
     constexpr auto a_end_args = TensorAccessorArgs<initial_states_args.next_compile_time_args_offset()>();
-    const auto a_end = TensorAccessor(a_end_args, a_end_addr, tile_size_bytes);
+    const auto a_end = TensorAccessor(a_end_args, a_end_addr, get_tile_size(a_end_scratch_cb_index));
 
     const uint32_t head_tiles = (head_dim + TILE_HEIGHT - 1) / TILE_HEIGHT;
     const uint32_t state_tiles = (state_size + TILE_WIDTH - 1) / TILE_WIDTH;
@@ -157,8 +190,8 @@ void kernel_main() {
             noc_async_read_tile(a_tile_id, a_end, a_scratch_addr);
             noc_async_read_barrier();
 
-            const volatile tt_l1_ptr uint32_t* a_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(a_scratch_addr);
-            const uint32_t a_scalar = a_ptr[get_tilized_idx(coord.head_idx % TILE_HEIGHT, chunk_in_tile)];
+            const uint32_t a_scalar_bits = float_to_bits(
+                read_tile_scalar(a_scratch_addr, a_end_dtype, coord.head_idx % TILE_HEIGHT, chunk_in_tile));
 
             const uint32_t tile_id = states_tile_id(
                 coord.batch_idx,
@@ -175,7 +208,7 @@ void kernel_main() {
             noc_async_read_tile(tile_id, states, states_l1_write_addr);
             noc_async_read_barrier();
             cb_push_back(states_cb_index, 1);
-            fill_broadcast_tile_from_scalar(a_end_cb_index, a_scalar);
+            fill_broadcast_tile_from_scalar(a_end_cb_index, a_scalar_bits);
 
             cb_push_back(a_end_scratch_cb_index, 1);
             cb_pop_front(a_end_scratch_cb_index, 1);

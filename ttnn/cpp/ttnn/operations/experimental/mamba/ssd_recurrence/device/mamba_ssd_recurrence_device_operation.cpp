@@ -62,6 +62,10 @@ std::optional<CoreGrid> get_core_grid(const MambaSSDRecurrenceParams& operation_
     return CoreGrid{operation_attributes.core_grid_x, operation_attributes.core_grid_y};
 }
 
+bool is_supported_dtype(const Tensor& tensor) {
+    return tensor.dtype() == ttnn::DataType::BFLOAT16 || tensor.dtype() == ttnn::DataType::FLOAT32;
+}
+
 Tensor segsum_local(const Tensor& input, const std::optional<MemoryConfig>& memory_config) {
     const auto& mem = memory_config;
     auto input_fp32 =
@@ -187,6 +191,12 @@ void MambaSSDRecurrenceDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(a_end_bhc.device() != nullptr, "a_end_bhc must be on device");
     TT_FATAL(states_bhcpn.device() == initial_states.device(), "states_bhcpn and initial_states must share a device");
     TT_FATAL(states_bhcpn.device() == a_end_bhc.device(), "states_bhcpn and a_end_bhc must share a device");
+    TT_FATAL(is_supported_dtype(states_bhcpn), "states_bhcpn must be BF16/FLOAT32");
+    TT_FATAL(is_supported_dtype(initial_states), "initial_states must be BF16/FLOAT32");
+    TT_FATAL(is_supported_dtype(a_end_bhc), "a_end_bhc must be BF16/FLOAT32");
+    TT_FATAL(states_bhcpn.layout() == ttnn::TILE_LAYOUT, "states_bhcpn must be TILE layout");
+    TT_FATAL(initial_states.layout() == ttnn::TILE_LAYOUT, "initial_states must be TILE layout");
+    TT_FATAL(a_end_bhc.layout() == ttnn::TILE_LAYOUT, "a_end_bhc must be TILE layout");
 
     TT_FATAL(s.rank() == 5, "states_bhcpn must be rank 5");
     TT_FATAL(i.rank() == 5, "initial_states must be rank 5");
@@ -200,7 +210,10 @@ void MambaSSDRecurrenceDeviceOperation::validate_on_program_cache_miss(
 
     TT_FATAL(i[0] == B && i[1] == H && i[2] == 1 && i[3] == P && i[4] == N, "initial_states shape mismatch");
     TT_FATAL(a[0] == B && a[1] == H && a[2] == C, "a_end_bhc shape mismatch");
-    TT_FATAL(args.memory_config.buffer_type() == tt::tt_metal::BufferType::DRAM, "v1 expects DRAM memory config");
+    TT_FATAL(!args.memory_config.is_sharded(), "mamba_ssd_recurrence output memory_config must be interleaved");
+    TT_FATAL(!states_bhcpn.memory_config().is_sharded(), "states_bhcpn must be interleaved");
+    TT_FATAL(!initial_states.memory_config().is_sharded(), "initial_states must be interleaved");
+    TT_FATAL(!a_end_bhc.memory_config().is_sharded(), "a_end_bhc must be interleaved");
 }
 
 void MambaSSDRecurrenceDeviceOperation::validate_on_program_cache_hit(
@@ -247,6 +260,10 @@ ttsl::hash::hash_t MambaSSDRecurrenceDeviceOperation::compute_program_hash(
         args.core_grid_y,
         tensor_args.states_bhcpn.dtype(),
         tensor_args.states_bhcpn.memory_config(),
+        tensor_args.initial_states.dtype(),
+        tensor_args.initial_states.memory_config(),
+        tensor_args.a_end_bhc.dtype(),
+        tensor_args.a_end_bhc.memory_config(),
         tensor_args.states_bhcpn.padded_shape(),
         tensor_args.initial_states.padded_shape(),
         tensor_args.a_end_bhc.padded_shape());
@@ -266,10 +283,11 @@ std::vector<Tensor> mamba_ssd_recurrence(
     const Tensor& states_bhcpn,
     const Tensor& initial_states,
     const Tensor& a_end_bhc,
-    std::optional<CoreGrid> core_grid) {
+    std::optional<CoreGrid> core_grid,
+    const std::optional<MemoryConfig>& memory_config) {
     using OperationType = ttnn::experimental::prim::MambaSSDRecurrenceDeviceOperation;
     auto operation_attributes = OperationType::operation_attributes_t{
-        .memory_config = ttnn::DRAM_MEMORY_CONFIG,
+        .memory_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG),
         .has_core_grid = core_grid.has_value(),
         .core_grid_x = core_grid.has_value() ? core_grid->x : 0,
         .core_grid_y = core_grid.has_value() ? core_grid->y : 0};
