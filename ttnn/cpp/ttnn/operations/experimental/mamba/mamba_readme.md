@@ -96,21 +96,21 @@
 
 ### API 파일
 
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/mamba_ssd_recurrence.hpp`
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/mamba_ssd_recurrence.cpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/mamba_ssd_recurrence.hpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/mamba_ssd_recurrence.cpp`
 
 ### Device op 파일
 
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/device/mamba_ssd_recurrence_device_operation.hpp`
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/device/mamba_ssd_recurrence_device_operation.cpp`
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/device/mamba_ssd_recurrence_device_operation_types.hpp`
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/device/mamba_ssd_recurrence_program_factory.hpp`
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/device/mamba_ssd_recurrence_program_factory.cpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/device/mamba_ssd_recurrence_device_operation.hpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/device/mamba_ssd_recurrence_device_operation.cpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/device/mamba_ssd_recurrence_device_operation_types.hpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/device/mamba_ssd_recurrence_program_factory.hpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/device/mamba_ssd_recurrence_program_factory.cpp`
 
 ### Nanobind 파일
 
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/mamba_ssd_recurrence_nanobind.hpp`
-- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/mamba_ssd_recurrence_nanobind.cpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/mamba_ssd_recurrence_nanobind.hpp`
+- `/home/wormhole/tt-metal/ttnn/cpp/ttnn/operations/experimental/mamba/ssd_recurrence/mamba_ssd_recurrence_nanobind.cpp`
 
 ## 참고할 패턴
 
