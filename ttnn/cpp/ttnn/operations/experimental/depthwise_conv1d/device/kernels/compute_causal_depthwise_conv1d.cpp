@@ -9,7 +9,6 @@
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/tile_move_copy.h"
 #include "ttnn/cpp/ttnn/kernel_lib/tilize_helpers.hpp"
-#include "ttnn/cpp/ttnn/kernel_lib/untilize_helpers.hpp"
 
 namespace {
 
@@ -114,16 +113,15 @@ void kernel_main() {
     constexpr uint32_t cb_partial = get_compile_time_arg_val(9);
     constexpr uint32_t cb_out_tiled = get_compile_time_arg_val(10);
     constexpr uint32_t cb_temp_sum = get_compile_time_arg_val(11);
-    constexpr uint32_t cb_out_rm0 = get_compile_time_arg_val(12);
-    constexpr uint32_t cb_out_rm1 = get_compile_time_arg_val(13);
-    constexpr uint32_t has_bias = get_compile_time_arg_val(14);
-    constexpr uint32_t silu_activation = get_compile_time_arg_val(15);
-    constexpr uint32_t debug_version = get_compile_time_arg_val(16);
+    constexpr uint32_t cb_final_out = get_compile_time_arg_val(12);
+    constexpr uint32_t has_bias = get_compile_time_arg_val(13);
+    constexpr uint32_t silu_activation = get_compile_time_arg_val(14);
+    constexpr uint32_t debug_version = get_compile_time_arg_val(15);
+    (void)debug_version;
 
     const uint32_t num_blocks = get_arg_val<uint32_t>(0);
 
     compute_kernel_hw_startup(cb_weight_rm, cb_weight_tiled);
-    compute_kernel_lib::untilize_init<width_tiles, cb_out_tiled, cb_out_rm0>();
 
     for (uint32_t k = 0; k < kernel_size; ++k) {
         compute_kernel_lib::tilize<width_tiles, cb_weight_rm, cb_weight_tiled>(1, block_height);
@@ -162,28 +160,6 @@ void kernel_main() {
             next_accum_cb = previous_accum_cb;
         }
 
-        if (current_accum_cb != cb_out_tiled) {
-            copy_block(current_accum_cb, cb_out_tiled, width_tiles);
-        }
-
-        if (block % 2 == 0) {
-            compute_kernel_lib::untilize<
-                width_tiles,
-                cb_out_tiled,
-                cb_out_rm0,
-                compute_kernel_lib::untilize_config::InitUninitMode::Neither,
-                compute_kernel_lib::untilize_config::WaitMode::WaitBlock,
-                compute_kernel_lib::untilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
-        } else {
-            compute_kernel_lib::untilize<
-                width_tiles,
-                cb_out_tiled,
-                cb_out_rm1,
-                compute_kernel_lib::untilize_config::InitUninitMode::Neither,
-                compute_kernel_lib::untilize_config::WaitMode::WaitBlock,
-                compute_kernel_lib::untilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
-        }
+        copy_block(current_accum_cb, cb_final_out, width_tiles);
     }
-
-    compute_kernel_lib::untilize_uninit<width_tiles, cb_out_tiled, cb_out_rm0>();
 }

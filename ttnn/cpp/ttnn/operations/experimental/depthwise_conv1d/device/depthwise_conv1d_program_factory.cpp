@@ -79,8 +79,7 @@ DepthwiseConv1dDeviceOperation::ProgramFactory::cached_program_t DepthwiseConv1d
     constexpr uint32_t cb_partial = tt::CBIndex::c_6;
     constexpr uint32_t cb_out_tiled = tt::CBIndex::c_7;
     constexpr uint32_t cb_temp_sum = tt::CBIndex::c_8;
-    constexpr uint32_t cb_out_rm0 = tt::CBIndex::c_9;
-    constexpr uint32_t cb_out_rm1 = tt::CBIndex::c_10;
+    constexpr uint32_t cb_final_out = tt::CBIndex::c_9;
 
     create_cb(cb_act_rm, program, all_cores, stick_nbytes, kBlockHeight * kernel_size * 2, input_df);
     create_cb(cb_act_tiled, program, all_cores, tile_nbytes, width_tiles * 2, input_df);
@@ -91,8 +90,7 @@ DepthwiseConv1dDeviceOperation::ProgramFactory::cached_program_t DepthwiseConv1d
     create_cb(cb_partial, program, all_cores, tile_nbytes, width_tiles, output_df);
     create_cb(cb_out_tiled, program, all_cores, tile_nbytes, width_tiles, output_df);
     create_cb(cb_temp_sum, program, all_cores, tile_nbytes, width_tiles, output_df);
-    create_cb(cb_out_rm0, program, all_cores, tile_nbytes, width_tiles, output_df);
-    create_cb(cb_out_rm1, program, all_cores, tile_nbytes, width_tiles, output_df);
+    create_cb(cb_final_out, program, all_cores, tile_nbytes, width_tiles, output_df);
 
     const bool has_bias = attrs.has_bias;
 
@@ -133,8 +131,7 @@ DepthwiseConv1dDeviceOperation::ProgramFactory::cached_program_t DepthwiseConv1d
         cb_partial,
         cb_out_tiled,
         cb_temp_sum,
-        cb_out_rm0,
-        cb_out_rm1,
+        cb_final_out,
         static_cast<uint32_t>(has_bias),
         static_cast<uint32_t>(attrs.silu_activation),
         kKernelDebugVersion,
@@ -151,13 +148,10 @@ DepthwiseConv1dDeviceOperation::ProgramFactory::cached_program_t DepthwiseConv1d
             .compile_args = compute_ct_args});
 
     std::vector<uint32_t> writer_ct_args = {
-        kBlockHeight,
-        sequence_length,
         blocks_per_batch,
-        stick_nbytes,
+        tile_nbytes,
         width_tiles,
-        cb_out_rm0,
-        cb_out_rm1,
+        cb_final_out,
         kKernelDebugVersion,
     };
     TensorAccessorArgs(dst_buffer).append_to(writer_ct_args);

@@ -629,11 +629,7 @@ std::vector<Tensor> depthwise_conv1d_forward_path(
         x_prepared, conv_state_tensor, batch_size, features, kernel_size);
     const bool force_disable_custom = !is_depthwise_conv1d_forward_custom_enabled();
 
-    if (supported_custom_shape) {
-        TT_FATAL(
-            !force_disable_custom,
-            "depthwise_conv1d fallback is disabled for the supported custom forward shape; "
-            "unset TTNN_DEPTHWISE_CONV1D_FORWARD_CUSTOM=0 to run the causal custom kernel");
+    if (supported_custom_shape && !force_disable_custom) {
         auto weight_causal = prepare_depthwise_weight_causal(weight, x, features, kernel_size);
         auto bias_causal = prepare_depthwise_bias_causal(bias, x, features);
         auto padded_input = build_stateful_causal_padded_input(
@@ -673,6 +669,13 @@ std::vector<Tensor> depthwise_conv1d_forward_path(
         mem,
         false,
         false));
+    output = ttnn::reshape(output, ttnn::Shape({batch_size, x.logical_shape()[1], features}), mem);
+    if (output.layout() != ttnn::TILE_LAYOUT) {
+        output = ttnn::to_layout(output, ttnn::TILE_LAYOUT);
+    }
+    if (silu_activation) {
+        output = ttnn::silu(output, mem);
+    }
     return {output, new_conv_state};
 }
 

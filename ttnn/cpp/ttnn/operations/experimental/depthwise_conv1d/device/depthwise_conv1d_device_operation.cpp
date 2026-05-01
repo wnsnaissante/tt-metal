@@ -54,12 +54,14 @@ DepthwiseConv1dDeviceOperation::spec_return_value_t DepthwiseConv1dDeviceOperati
     const uint32_t batch = input.logical_shape()[0];
 
     ttnn::Shape output_shape({batch, 1, attrs.sequence_length, attrs.channels});
+    const uint32_t padded_sequence_length = ((attrs.sequence_length + 31) / 32) * 32;
+    ttnn::Shape padded_output_shape({batch, 1, padded_sequence_length, attrs.channels});
     auto output_mem_config = input.memory_config();
 
     return TensorSpec(
         output_shape,
         TensorLayout::fromPaddedShape(
-            input.dtype(), PageConfig(Layout::ROW_MAJOR), output_mem_config, output_shape, output_shape));
+            input.dtype(), PageConfig(Layout::TILE), output_mem_config, output_shape, padded_output_shape));
 }
 
 DepthwiseConv1dDeviceOperation::tensor_return_value_t DepthwiseConv1dDeviceOperation::create_output_tensors(

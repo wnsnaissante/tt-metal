@@ -5,8 +5,6 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
-#include "api/debug/dprint.h"
-
 void kernel_main() {
     constexpr uint32_t block_height = get_compile_time_arg_val(0);
     constexpr uint32_t kernel_size = get_compile_time_arg_val(1);
@@ -19,12 +17,9 @@ void kernel_main() {
     constexpr uint32_t cb_weight_rm = get_compile_time_arg_val(8);
     constexpr uint32_t cb_bias_rm = get_compile_time_arg_val(9);
     constexpr uint32_t has_bias = get_compile_time_arg_val(10);
-    constexpr uint32_t debug_version = get_compile_time_arg_val(11);
     constexpr auto input_args = TensorAccessorArgs<12>();
     constexpr auto weight_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
     constexpr auto bias_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
-
-    DPRINT << "dwconv1d reader entry v=" << debug_version << ENDL();
 
     const uint32_t input_dram_addr = get_arg_val<uint32_t>(0);
     const uint32_t weight_dram_addr = get_arg_val<uint32_t>(1);
@@ -32,13 +27,9 @@ void kernel_main() {
     const uint32_t start_block = get_arg_val<uint32_t>(3);
     const uint32_t num_blocks = get_arg_val<uint32_t>(4);
 
-    DPRINT << "dwconv1d reader start v=" << debug_version << " blocks=" << num_blocks << " start_block=" << start_block
-           << ENDL();
-
     const auto input_accessor = TensorAccessor(input_args, input_dram_addr, stick_nbytes);
     const auto weight_accessor = TensorAccessor(weight_args, weight_dram_addr, stick_nbytes);
     const auto bias_accessor = TensorAccessor(bias_args, bias_dram_addr, stick_nbytes);
-    DPRINT << "dwconv1d reader accessors ready v=" << debug_version << ENDL();
 
     cb_reserve_back(cb_weight_rm, kernel_size * block_height);
     uint32_t weight_write_addr = get_write_ptr(cb_weight_rm);
@@ -49,7 +40,6 @@ void kernel_main() {
     }
     noc_async_read_barrier();
     cb_push_back(cb_weight_rm, kernel_size * block_height);
-    DPRINT << "dwconv1d reader weight ready" << ENDL();
 
     if constexpr (has_bias) {
         cb_reserve_back(cb_bias_rm, block_height);
@@ -92,11 +82,5 @@ void kernel_main() {
             }
         }
         cb_push_back(cb_act_rm, kernel_size * block_height);
-
-        if (local_block == 0) {
-            DPRINT << "dwconv1d reader first block pushed block=" << block << ENDL();
-        }
     }
-
-    DPRINT << "dwconv1d reader done" << ENDL();
 }
